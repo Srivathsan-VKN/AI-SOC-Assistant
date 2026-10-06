@@ -10,7 +10,7 @@ evidence it was given, and raises a corresponding alert in DFIR-IRIS.
 investigation rigor to every one. This assists, not replaces, judgment and helps the new analyst to learn by doing the work.]
 
 ## Architecture
-[Diagram - can be a Mermaid block, see docs/architecture.md for detail]
+[Diagram - can be a Mermaid block, see [docs/architecture.md](docs/architecture.md) for detail]
 
 ## What it does
 1. Receives Wazuh alert via webhook
