@@ -1,0 +1,854 @@
+{
+  "name": "AI SOC Assistant",
+  "nodes": [
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// V1 requirement: an individual bad alert must not destroy the workflow.\n// This is the first gate: confirm the minimum fields we need even exist\n// before we try to normalize/enrich/reason about the alert.\nconst body = $json.body;\nconst errors = [];\n\nif (!body) errors.push('missing_body');\nif (body && !body.rule) errors.push('missing_rule');\nif (body && !body.timestamp) errors.push('missing_timestamp');\nif (body && !body.agent) errors.push('missing_agent');\n\nreturn {\n  json: {\n    raw_body: body || {},\n    validation_errors: errors,\n    is_valid: errors.length === 0\n  }\n};"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -3776,
+        -144
+      ],
+      "id": "90fbf80e-86fc-4740-be2c-a907da0caba2",
+      "name": "Validate Input"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "cond-is-valid",
+              "leftValue": "={{ $json.is_valid }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        -3552,
+        -144
+      ],
+      "id": "22fb4194-e199-4cbe-8c01-6d3dfc4db872",
+      "name": "IF Valid Alert"
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// Terminal node for the invalid branch.\n// We never silently discard an alert - we always produce a record,\n// even when the alert couldn't be processed further.\nreturn {\n  json: {\n    status: 'REJECTED_INVALID_INPUT',\n    wazuh_alert_id: $json.raw_body?.id || null,\n    validation_errors: $json.validation_errors,\n    received_at: new Date().toISOString(),\n    message: 'Alert was missing required fields and could not be triaged. See validation_errors.'\n  }\n};"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -3328,
+        -48
+      ],
+      "id": "5ca2f3e8-50f8-4943-87a9-0d0b5ebcebaa",
+      "name": "Invalid Alert Report"
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// Wazuh is an input format, not our internal language (Build Guide S8).\n// Build one stable internal object. Missing values become explicit null,\n// never a fabricated default, and we keep the original alert for provenance.\nconst body = $json.raw_body;\n\nfunction get(path, fallback = null) {\n  try {\n    const val = path.split('.').reduce((o, k) => (o == null ? undefined : o[k]), body);\n    return (val === undefined || val === '') ? fallback : val;\n  } catch (e) {\n    return fallback;\n  }\n}\n\nconst normalized = {\n  wazuh_alert_id: get('id'),\n  timestamp: get('timestamp'),\n  rule: {\n    id: get('rule.id'),\n    description: get('rule.description'),\n    level: get('rule.level'),\n    groups: get('rule.groups', [])\n  },\n  host: { name: get('agent.name'), ip: get('agent.ip') },\n  user: get('data.win.eventdata.targetUserName') || get('data.srcuser') || get('data.dstuser'),\n  process: get('data.win.eventdata.image') || get('data.process.name'),\n  parent_process: get('data.win.eventdata.parentImage'),\n  command_line: get('data.win.eventdata.commandLine'),\n  auth_result: get('data.win.eventdata.status'),\n  network: { source_ip: get('data.srcip'), destination_ip: get('data.dstip') },\n  file: { path: get('syscheck.path'), event: get('syscheck.event') },\n  full_log: get('full_log'),\n  raw_alert: body\n};\n\nreturn { json: normalized };"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -3328,
+        -240
+      ],
+      "id": "537e7e48-81e6-474b-ae85-96942f099a6b",
+      "name": "Normalize Alert"
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "const raw = $json.raw_alert || {};\nconst mitreIdsRaw = raw?.rule?.mitre?.id ?? [];\nconst mitreTacticsRaw = raw?.rule?.mitre?.tactic ?? [];\nconst text = JSON.stringify(raw);\nconst cveIds = [...new Set(text.match(/CVE-\\d{4}-\\d{4,7}/g) || [])];\n\nreturn {\n  json: {\n    ...$json,\n    mitre_ids_observed: mitreIdsRaw,\n    mitre_tactics_observed: mitreTacticsRaw,\n    cve_ids_observed: cveIds\n  }\n};"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -3104,
+        -240
+      ],
+      "id": "d15b0fcb-9307-48c5-838e-77d9acff9d54",
+      "name": "Extract MITRE and CVE"
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// Build Guide S9: the model must not invent MITRE context, and every\n// technique ID must be resolved against VERIFIED data before it reaches\n// the LLM. This is a small local lookup of the common techniques this\n// Wazuh ruleset actually surfaces - not the full ATT&CK dataset.\n// Anything not in this table is kept as UNRESOLVED, never dropped, so\n// the analyst knows to verify it manually at attack.mitre.org.\nconst MITRE_LOOKUP = {\n  'T1110': { name: 'Brute Force', tactic: 'Credential Access' },\n  'T1110.001': { name: 'Password Guessing', tactic: 'Credential Access' },\n  'T1110.003': { name: 'Password Spraying', tactic: 'Credential Access' },\n  'T1059': { name: 'Command and Scripting Interpreter', tactic: 'Execution' },\n  'T1059.001': { name: 'PowerShell', tactic: 'Execution' },\n  'T1078': { name: 'Valid Accounts', tactic: 'Defense Evasion / Persistence / Privilege Escalation / Initial Access' },\n  'T1021': { name: 'Remote Services', tactic: 'Lateral Movement' },\n  'T1053': { name: 'Scheduled Task/Job', tactic: 'Execution / Persistence / Privilege Escalation' },\n  'T1547': { name: 'Boot or Logon Autostart Execution', tactic: 'Persistence / Privilege Escalation' },\n  'T1490': { name: 'Inhibit System Recovery', tactic: 'Impact' },\n  'T1486': { name: 'Data Encrypted for Impact', tactic: 'Impact' },\n  'T1027': { name: 'Obfuscated Files or Information', tactic: 'Defense Evasion' },\n  'T1105': { name: 'Ingress Tool Transfer', tactic: 'Command and Control' },\n  'T1071': { name: 'Application Layer Protocol', tactic: 'Command and Control' },\n  'T1046': { name: 'Network Service Discovery', tactic: 'Discovery' },\n  'T1003': { name: 'OS Credential Dumping', tactic: 'Credential Access' },\n  'T1055': { name: 'Process Injection', tactic: 'Defense Evasion / Privilege Escalation' },\n  'T1566': { name: 'Phishing', tactic: 'Initial Access' },\n  'T1204': { name: 'User Execution', tactic: 'Execution' },\n  'T1565': { name: 'Data Manipulation', tactic: 'Impact' },\n  'T1565.001': { name: 'Stored Data Manipulation', tactic: 'Impact' },\n  'T1565.002': { name: 'Transmitted Data Manipulation', tactic: 'Impact' },\n  'T1565.003': { name: 'Runtime Data Manipulation', tactic: 'Impact' },\n  'T1070': { name: 'Indicator Removal', tactic: 'Defense Evasion' },\n  'T1036': { name: 'Masquerading', tactic: 'Defense Evasion' }\n};\n\nconst observedIds = $json.mitre_ids_observed || [];\nconst resolved = [];\nconst unresolved = [];\n\nfor (const id of observedIds) {\n  if (MITRE_LOOKUP[id]) {\n    resolved.push({ id, name: MITRE_LOOKUP[id].name, tactic: MITRE_LOOKUP[id].tactic, status: 'VERIFIED' });\n  } else {\n    unresolved.push({ id, status: 'UNRESOLVED_CHECK_MANUALLY' });\n  }\n}\n\nreturn { json: { ...$json, mitre_resolved: resolved, mitre_unresolved: unresolved } };"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -2880,
+        -240
+      ],
+      "id": "6a9e4b25-6776-4090-804d-acc1df2579ef",
+      "name": "Resolve MITRE"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "cond-has-cve",
+              "leftValue": "={{ $json.cve_ids_observed.length }}",
+              "rightValue": 0,
+              "operator": {
+                "type": "number",
+                "operation": "gt"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        -2656,
+        -240
+      ],
+      "id": "07ccb151-88ed-46b9-a36a-90dc080f39aa",
+      "name": "IF Has CVE"
+    },
+    {
+      "parameters": {
+        "url": "=https://services.nvd.nist.gov/rest/json/cves/2.0?cveId={{ $json.cve_ids_observed[0] }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [
+        -2432,
+        -336
+      ],
+      "id": "3e7ccac9-da2a-456d-b3b7-c14d31c24dbd",
+      "name": "Lookup NVD",
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "jjwk2KHXfNUP1RU0",
+          "name": "NVD"
+        }
+      },
+      "notes": "Select your existing NVD Header Auth credential here after import. Only the first CVE is enriched in V1 - if an alert has multiple CVEs, the rest are listed but not queried (see cve_ids_observed)."
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// Turn the raw NVD response into a small, verified context block.\n// Never throw here - an enrichment failure must not kill the whole alert.\nlet nvd_context = { status: 'NO_DATA' };\ntry {\n  const vuln = $json?.vulnerabilities?.[0]?.cve;\n  if (vuln) {\n    const desc = (vuln.descriptions || []).find(d => d.lang === 'en')?.value || null;\n    const metrics = vuln.metrics || {};\n    const cvssBlock = metrics.cvssMetricV31?.[0] || metrics.cvssMetricV30?.[0] || metrics.cvssMetricV2?.[0];\n    nvd_context = {\n      status: 'VERIFIED',\n      cve_id: vuln.id,\n      description: desc,\n      cvss_score: cvssBlock?.cvssData?.baseScore ?? null,\n      cvss_severity: cvssBlock?.cvssData?.baseSeverity ?? cvssBlock?.baseSeverity ?? null\n    };\n  } else {\n    nvd_context = { status: 'NOT_FOUND' };\n  }\n} catch (e) {\n  nvd_context = { status: 'ENRICHMENT_FAILED', error: String(e) };\n}\n\nreturn { json: { ...$('Resolve MITRE').item.json, nvd_context } };"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -2208,
+        -336
+      ],
+      "id": "4ab64591-71ca-45f9-b496-b7be58f2672a",
+      "name": "Extract NVD Context"
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "return { json: { ...$json, nvd_context: { status: 'NO_CVE_PRESENT' } } };"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -2208,
+        -144
+      ],
+      "id": "7484e373-423f-4a97-85d4-9a9864af3f85",
+      "name": "Set Empty NVD Context"
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "const j = $json;\n\nconst knownUnknowns = [];\nif (!j.user) knownUnknowns.push('user/account not present in alert');\nif (!j.process) knownUnknowns.push('process not present in alert');\nif (!j.parent_process) knownUnknowns.push('parent process not present in alert');\nif (!j.command_line) knownUnknowns.push('command line not present in alert');\nif (!j.network?.source_ip && !j.network?.destination_ip) knownUnknowns.push('network source/destination not present in alert');\nif ((j.mitre_unresolved || []).length > 0) knownUnknowns.push('one or more MITRE IDs could not be verified locally');\nif (j.nvd_context?.status === 'ENRICHMENT_FAILED') knownUnknowns.push('CVE enrichment failed - treat any CVE claim as unverified');\n\nconst evidence_package = {\n  alert: {\n    wazuh_alert_id: j.wazuh_alert_id,\n    timestamp: j.timestamp,\n    rule: j.rule,\n    host: j.host,\n    user: j.user,\n    process: j.process,\n    parent_process: j.parent_process,\n    command_line: j.command_line,\n    auth_result: j.auth_result,\n    network: j.network,\n    file: j.file,\n    full_log: j.full_log\n  },\n  enrichment: {\n    mitre_verified: j.mitre_resolved,\n    mitre_unresolved: j.mitre_unresolved,\n    cve_context: j.nvd_context\n  },\n  known_unknowns: knownUnknowns\n};\n\nreturn { json: { ...j, evidence_package } };"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -1984,
+        -240
+      ],
+      "id": "68ba833f-6fd4-41d4-9521-0531c752e866",
+      "name": "Build Evidence Package"
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// Build Guide S11: clearly separated evidence package, never let the\n// model guess. Everything below TASK is the only thing it may reason from.\nconst p = $json.evidence_package;\n\nconst prompt = `ALERT OBSERVATIONS (directly from Wazuh - treat as fact)\n${JSON.stringify(p.alert, null, 2)}\n\nVERIFIED MITRE ATT&CK CONTEXT (resolved locally, safe to cite)\n${JSON.stringify(p.enrichment.mitre_verified, null, 2)}\n\nUNVERIFIED MITRE IDS (present in alert, NOT confirmed - flag, do not treat as fact)\n${JSON.stringify(p.enrichment.mitre_unresolved, null, 2)}\n\nVERIFIED CVE CONTEXT (from NVD, safe to cite if status is VERIFIED)\n${JSON.stringify(p.enrichment.cve_context, null, 2)}\n\nKNOWN UNKNOWNS (missing from this alert - never fabricate these)\n${JSON.stringify(p.known_unknowns, null, 2)}\n\nTASK\nYou are mentoring a junior SOC analyst who has never seen this alert type before.\nUsing ONLY the evidence above, produce a guided triage analysis as the required JSON.\nEvery suspicious_indicator and key_evidence item must point to something actually\npresent in ALERT OBSERVATIONS or VERIFIED context above - never invent details.\nWhere something is not observable, say so explicitly instead of guessing.`;\n\nreturn { json: { ...$json, llm_prompt: prompt } };"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -1760,
+        -240
+      ],
+      "id": "89037862-90f5-4488-9816-438ea092f82a",
+      "name": "Build LLM Prompt"
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// Build Guide S18: priority is deterministic, not left to the model alone.\nconst level = $json.rule?.level ?? 0;\nconst hasVerifiedMitre = ($json.evidence_package?.enrichment?.mitre_verified || []).length > 0;\nconst cve = $json.evidence_package?.enrichment?.cve_context || {};\nconst cvssScore = cve.cvss_score || 0;\nconst verdict = $json.ai?.verdict;\n\nlet score = 0;\nif (level >= 12) score += 4;\nelse if (level >= 9) score += 3;\nelse if (level >= 6) score += 2;\nelse score += 1;\n\nif (hasVerifiedMitre) score += 1;\nif (cvssScore >= 9) score += 3;\nelse if (cvssScore >= 7) score += 2;\nelse if (cvssScore > 0) score += 1;\nif (verdict === 'TRUE_POSITIVE') score += 2;\nelse if (verdict === 'NEEDS_INVESTIGATION') score += 1;\n\nlet priority;\nif (score >= 8) priority = 'P1';\nelse if (score >= 6) priority = 'P2';\nelse if (score >= 4) priority = 'P3';\nelse priority = 'P4';\n\nreturn { json: { ...$json, priority: { level: priority, score } } };"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -864,
+        -240
+      ],
+      "id": "a1f4fbdc-654c-40f5-9599-008af6978479",
+      "name": "Calculate Priority"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://host.docker.internal:11434/api/chat",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{\n  JSON.stringify({\n    \"model\": \"hf.co/mradermacher/Gemma4Defense-2B-GGUF:Q4_K_M\",\n    \"messages\": [\n      {\n        \"role\": \"system\",\n        \"content\": `You are a Tier-1 SOC mentor training a junior analyst. Rules you must follow:\n1. You NEVER invent facts. Only reason over ALERT OBSERVATIONS, VERIFIED MITRE CONTEXT and VERIFIED CVE CONTEXT given to you.\n2. A MITRE technique ID being present is NOT proof of malicious intent by itself - it only tells you the TYPE of behavior, not the INTENT. You must independently weigh evidence for and against malicious intent.\n3. Metadata-only changes (e.g. a timestamp/mtime change with no content difference) are WEAKER evidence than actual content or behavioral changes. Say so explicitly when relevant, and do not assign high confidence to TRUE_POSITIVE on metadata-only evidence alone.\n4. Always propose at least one concrete benign explanation, even for alerts that look suspicious - this is mandatory, not optional.\n5. Where information is missing, say 'unknown' or 'not observed'. Never guess.\n6. Output ONLY valid JSON. No markdown, no preamble, no extra top-level keys, no thinking text outside the JSON.\n7. You MUST use exactly these top-level keys, no others: summary, what_happened, key_evidence, suspicious_indicators, benign_possibilities, verification_steps, verdict, confidence, severity, recommended_action, supporting_actions, countermeasures, reasoning, mitre_ids, cve_ids.\n8. Confidence anchors (use this scale, do not default to round numbers out of habit): 10-30 = weak/ambiguous, at most one plausible signal. 40-60 = mixed evidence, genuinely needs human review. 70-85 = multiple independent suspicious indicators with no strong benign explanation. 90+ = reserved for verified malicious CVE/MITRE context PLUS direct behavioral evidence, never metadata alone. Justify the number against this scale inside your reasoning field.\n9. benign_possibilities is NOT optional, even for a high-confidence TRUE_POSITIVE - give at least one concrete, alert-specific benign explanation or your output is invalid.\n10. severity must be one of CRITICAL | HIGH | MEDIUM | LOW | NONE, reflecting the potential impact if true, independent of your confidence that it is true.\n11. mitre_ids must ONLY contain technique IDs that appear in ALERT OBSERVATIONS, VERIFIED MITRE CONTEXT, or UNVERIFIED MITRE IDS above. Do not attribute a technique from general knowledge if no MITRE ID appears anywhere in the evidence \u2014 leave mitre_ids empty instead.\n12. decision_options: brainstorm 2-3 realistic next steps a Tier-1 analyst could reasonably take given this evidence (e.g. \"escalate to Tier 2\", \"close as benign with a note\", \"monitor for 24h and re-check\"). For each, state when_this_applies - the specific condition under which THAT option, not the others, is the right call. This is not a single prescribed action - the analyst decides. Do not include automated/system actions (blocking IPs, disabling accounts, isolating hosts) as options - this system does not take response actions, only recommends investigation paths.\n\nEXAMPLE OF THE EXACT SHAPE REQUIRED (values illustrative only, use your own real analysis):\n{\n  \"summary\": \"A file integrity alert fired on host X after file Y was modified.\",\n  \"what_happened\": \"Wazuh syscheck detected that file Y changed on host X at time Z.\",\n  \"key_evidence\": [ { \"item\": \"file path\", \"why_it_matters\": \"identifies what was touched\" } ],\n  \"suspicious_indicators\": [ { \"indicator\": \"unexpected file modification\", \"evidence\": \"mtime changed outside business hours\" } ],\n  \"benign_possibilities\": [ \"scheduled backup job touched the file\", \"antivirus scan updated metadata\" ],\n  \"verification_steps\": [ { \"check\": \"review process that modified the file\", \"purpose\": \"confirm if it was an authorized process\" } ],\n  \"verdict\": \"NEEDS_INVESTIGATION\",\n  \"confidence\": 55,\n  \"recommended_action\": \"Identify the process/user that modified the file before escalating.\",\n  \"supporting_actions\": [ \"check scheduled tasks on host X\" ],\n  \"countermeasures\": [ \"enable process auditing for this file path\" ],\n  \"reasoning\": \"Only metadata changed, no content diff, so malicious tampering is not confirmed.\",\n  \"mitre_ids\": [ \"T1565.001\" ],\n  \"cve_ids\": [],\n  \"severity\": \"MEDIUM\"\n}\n\nSECOND EXAMPLE - CONTRASTING FALSE_POSITIVE (do not default to NEEDS_INVESTIGATION by habit):\n{\n  \"summary\": \"A brute-force detection rule fired for repeated failed logins from a known internal automation host during a documented patch window.\",\n  \"what_happened\": \"Wazuh flagged 8 failed SSH logins from host 10.10.5.20 to host 10.10.5.40 within 2 minutes.\",\n  \"key_evidence\": [ { \"item\": \"source IP is an internal, known automation host\", \"why_it_matters\": \"reduces likelihood of external attacker\" } ],\n  \"suspicious_indicators\": [ { \"indicator\": \"repeated auth failures\", \"evidence\": \"8 failures in 2 minutes matches rule threshold\" } ],\n  \"benign_possibilities\": [ \"a scheduled config-management job with a stale credential\", \"an automated patch script retrying before failing gracefully\" ],\n  \"verification_steps\": [ { \"check\": \"confirm host 10.10.5.20 is the known automation server for this window\", \"purpose\": \"rule out attacker pivoting from that host\" } ],\n  \"verdict\": \"FALSE_POSITIVE\",\n  \"confidence\": 25,\n  \"reasoning\": \"Source is a known internal automation host during a documented patch window; volume and pattern match known benign automation retries, not credential-guessing behavior.\",\n  \"recommended_action\": \"Close as benign, note the automation host in the allowlist for this rule.\",\n  \"supporting_actions\": [ \"verify with change management that a patch window was scheduled\" ],\n  \"countermeasures\": [ \"add a lower-severity rule tier for known automation hosts to reduce alert fatigue\" ],\n  \"mitre_ids\": [ \"T1110\" ],\n  \"cve_ids\": [],\n  \"severity\": \"LOW\"\n}`\n      },\n      {\n        \"role\": \"user\",\n        \"content\": $json.llm_prompt\n      }\n    ],\n    \"stream\": false,\n    \"format\": {\n      \"type\": \"object\",\n      \"properties\": {\n        \"summary\": { \"type\": \"string\" },\n        \"what_happened\": { \"type\": \"string\" },\n        \"key_evidence\": {\n          \"type\": \"array\",\n          \"items\": {\n            \"type\": \"object\",\n            \"properties\": {\n              \"item\": { \"type\": \"string\" },\n              \"why_it_matters\": { \"type\": \"string\" }\n            },\n            \"required\": [\"item\", \"why_it_matters\"]\n          }\n        },\n        \"suspicious_indicators\": {\n          \"type\": \"array\",\n          \"items\": {\n            \"type\": \"object\",\n            \"properties\": {\n              \"indicator\": { \"type\": \"string\" },\n              \"evidence\": { \"type\": \"string\" }\n            },\n            \"required\": [\"indicator\", \"evidence\"]\n          }\n        },\n        \"benign_possibilities\": { \"type\": \"array\", \"items\": { \"type\": \"string\" }, \"minItems\": 1 },\n        \"verification_steps\": {\n          \"type\": \"array\",\n          \"items\": {\n            \"type\": \"object\",\n            \"properties\": {\n              \"check\": { \"type\": \"string\" },\n              \"purpose\": { \"type\": \"string\" }\n            },\n            \"required\": [\"check\", \"purpose\"]\n          }\n        },\n        \"verdict\": { \"type\": \"string\", \"enum\": [\"TRUE_POSITIVE\", \"FALSE_POSITIVE\", \"NEEDS_INVESTIGATION\"] },\n        \"confidence\": { \"type\": \"integer\", \"minimum\": 0, \"maximum\": 100 },\n        \"severity\": { \"type\": \"string\", \"enum\": [\"CRITICAL\", \"HIGH\", \"MEDIUM\", \"LOW\", \"NONE\"] },\n        \"recommended_action\": { \"type\": \"string\" },\n        \"supporting_actions\": { \"type\": \"array\", \"items\": { \"type\": \"string\" } },\n        \"countermeasures\": { \"type\": \"array\", \"items\": { \"type\": \"string\" } },\n        \"reasoning\": { \"type\": \"string\" },\n        \"mitre_ids\": { \"type\": \"array\", \"items\": { \"type\": \"string\" } },\n        \"cve_ids\": { \"type\": \"array\", \"items\": { \"type\": \"string\" } }\n      },\n      \"required\": [\"summary\", \"what_happened\", \"key_evidence\", \"suspicious_indicators\", \"benign_possibilities\", \"verification_steps\", \"verdict\", \"confidence\", \"severity\", \"recommended_action\", \"reasoning\", \"mitre_ids\", \"cve_ids\"],\n      \"additionalProperties\": false\n    },\n    \"options\": {\n      \"temperature\": 0.2,\n      \"top_p\": 0.85,\n      \"repeat_penalty\": 1.1\n    }\n  })\n}}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [
+        -1536,
+        -240
+      ],
+      "id": "4037a633-5448-42c8-a25d-e829c93345b3",
+      "name": "Ollama LLM Call1"
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "const priorContext = $('Build LLM Prompt').item.json;\nlet parse_error = null;\nlet raw = {};\ntry {\n  let rawText = $json.message.content;\n  rawText = rawText.replace(/```json/gi, '').replace(/```/g, '').trim();\n  raw = JSON.parse(rawText);\n} catch (e) {\n  parse_error = String(e);\n}\n\n// Tolerant normalization: map whatever shape the model gives onto our canonical\n// fields. IMPORTANT: unlike the old version, this keeps the \"why it matters\" /\n// \"evidence\" / \"purpose\" companion text instead of collapsing objects down to a\n// single string - that companion text is the teaching content the guide (S12.3)\n// requires, so dropping it defeats the point of the assistant.\nfunction toObjArray(v, keyMap) {\n  // keyMap: { primary: [...possible keys...], detail: [...possible keys...] }\n  if (!Array.isArray(v)) {\n    if (typeof v === 'string' && v.trim()) return [{ item: v.trim(), detail: null }];\n    return [];\n  }\n  return v.map(x => {\n    if (typeof x === 'string') return { item: x, detail: null };\n    if (x && typeof x === 'object') {\n      const primary = keyMap.primary.map(k => x[k]).find(val => val) || null;\n      const detail = keyMap.detail.map(k => x[k]).find(val => val) || null;\n      return { item: primary || JSON.stringify(x), detail };\n    }\n    return { item: JSON.stringify(x), detail: null };\n  });\n}\n\nfunction toStringArray(v) {\n  if (Array.isArray(v)) return v.map(x => typeof x === 'string' ? x : (x?.item || x?.check || JSON.stringify(x)));\n  if (typeof v === 'string' && v.trim()) return [v.trim()];\n  return [];\n}\n\nfunction normalizeVerdict(v) {\n  if (v === undefined || v === null || v === '') return null; // caller must treat null as a hard failure, not a verdict\n  const s = String(v).toLowerCase();\n  if (s.includes('true') || s.includes('malicious') || s.includes('confirmed')) return 'TRUE_POSITIVE';\n  if (s.includes('false') || s.includes('benign')) return 'FALSE_POSITIVE';\n  if (s.includes('investigat') || s.includes('suspicious') || s.includes('unclear') || s.includes('unknown')) return 'NEEDS_INVESTIGATION';\n  return null; // unrecognized value - do not silently coerce into a default verdict\n}\n\nfunction normalizeConfidence(v) {\n  const n = parseFloat(v);\n  if (isNaN(n)) return null;\n  const pct = n <= 1 ? Math.round(n * 100) : Math.round(n);\n  return Math.max(0, Math.min(100, pct)); // clamp - a model returning 120 or -5 must not reach the analyst\n}\n\nfunction normalizeSeverity(v) {\n  const s = String(v || '').toUpperCase();\n  if (['CRITICAL', 'HIGH', 'MEDIUM', 'LOW', 'NONE'].includes(s)) return s;\n  return 'UNKNOWN';\n}\n\nconst ai = {\n  summary: raw.summary || raw.report || null,\n  what_happened: raw.what_happened || null,\n  key_evidence: toObjArray(raw.key_evidence, { primary: ['item'], detail: ['why_it_matters'] }),\n  suspicious_indicators: toObjArray(raw.suspicious_indicators, { primary: ['indicator'], detail: ['evidence'] }),\n  benign_explanations: toStringArray(raw.benign_possibilities || raw.benign_explanations),\n  verification_steps: toObjArray(raw.verification_steps, { primary: ['check'], detail: ['purpose'] }),\n  verdict: normalizeVerdict(raw.verdict),\n  confidence: normalizeConfidence(raw.confidence),\n  severity: normalizeSeverity(raw.severity),\n  reasoning: raw.reasoning || raw.report || null,\n  recommended_action: raw.recommended_action || null,\n  supporting_actions: toStringArray(raw.supporting_actions),\n  countermeasures: toStringArray(raw.countermeasures),\n  mitre_ids: toStringArray(raw.mitre_ids || raw.mitre_attack_techniques),\n  cve_ids: toStringArray(raw.cve_ids)\n};\n\nconst requiredKeys = ['summary','what_happened','key_evidence','suspicious_indicators',\n  'benign_possibilities','verification_steps','verdict','confidence','severity',\n  'recommended_action','reasoning','mitre_ids','cve_ids'];\nconst missing_from_model = requiredKeys.filter(k => !(k in raw));\n\nreturn { json: { ...priorContext, ai, ai_raw: raw, llm_parse_error: parse_error, llm_missing_keys: missing_from_model } };\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -1312,
+        -240
+      ],
+      "id": "de866146-5ae9-4195-9e24-12b370cf8842",
+      "name": "Parse LLM Output1"
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "const ai = $json.ai || {};\nconst issues = [];\n\nif (!ai.summary) issues.push('missing_field:summary');\nif (!ai.reasoning) issues.push('missing_field:reasoning');\nif (ai.verdict === null || !['TRUE_POSITIVE', 'FALSE_POSITIVE', 'NEEDS_INVESTIGATION'].includes(ai.verdict)) issues.push('invalid_verdict');\nif ($json.llm_missing_keys && $json.llm_missing_keys.length > 0) issues.push('schema_keys_missing_from_model:' + $json.llm_missing_keys.join(','));\nif ($json.llm_parse_error) issues.push('llm_output_not_valid_json');\n\n// Guide S12 requires the model to always propose a benign explanation, even for\n// a confident TRUE_POSITIVE - a missing one means the analyst isn't getting the\n// balanced reasoning this assistant exists to teach, so flag it explicitly.\nif (!ai.benign_explanations || ai.benign_explanations.length === 0) issues.push('missing_benign_explanation');\n\n// A verdict with no supporting indicators is not a defensible triage decision -\n// flag it rather than silently accepting an unsupported TRUE_POSITIVE/FALSE_POSITIVE.\nif ((ai.verdict === 'TRUE_POSITIVE' || ai.verdict === 'FALSE_POSITIVE') &&\n    (!ai.suspicious_indicators || ai.suspicious_indicators.length === 0) &&\n    (!ai.key_evidence || ai.key_evidence.length === 0)) {\n  issues.push('verdict_without_supporting_evidence');\n}\n\nif (ai.confidence === null || ai.confidence === undefined) issues.push('missing_field:confidence');\nif (ai.severity === 'UNKNOWN') issues.push('missing_or_invalid_severity');\n\nconst verifiedMitreIds = (($json.evidence_package?.enrichment?.mitre_verified) || []).map(m => m.id);\nconst observedMitreIds = [...verifiedMitreIds, ...(($json.evidence_package?.enrichment?.mitre_unresolved) || []).map(m => m.id)];\nconst mitre_validation = (ai.mitre_ids || []).map(id => ({\n  id,\n  status: verifiedMitreIds.includes(id) ? 'VERIFIED'\n        : observedMitreIds.includes(id) ? 'UNRESOLVED_IN_ALERT'\n        : 'UNVALIDATED_NOT_IN_EVIDENCE'\n}));\n\nconst observedCveIds = $json.cve_ids_observed || [];\nconst cve_validation = (ai.cve_ids || []).map(id => ({\n  id,\n  status: observedCveIds.includes(id) ? 'PRESENT_IN_ALERT' : 'UNVALIDATED_NOT_IN_EVIDENCE'\n}));\n\n// Only schema-breaking issues make the output unusable; missing_benign_explanation\n// and verdict_without_supporting_evidence are quality warnings surfaced to the\n// analyst, not hard failures, since the guide favors transparency over silently\n// discarding an otherwise-parseable result.\nconst hardFailures = issues.filter(i =>\n  i === 'invalid_verdict' || i === 'llm_output_not_valid_json' || i.startsWith('schema_keys_missing_from_model:')\n);\n\nreturn {\n  json: {\n    ...$json,\n    validation: {\n      schema_issues: issues,\n      mitre_validation,\n      cve_validation,\n      is_usable: hardFailures.length === 0\n    }\n  }\n};\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -1088,
+        -240
+      ],
+      "id": "09e284e0-e14c-4076-ab02-aa2f33ad87f7",
+      "name": "Validate LLM Output1"
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "const j = $json;\nconst ai = j.ai || {};\n\nconst report = {\n  \"1_alert_summary\": ai.summary,\n  \"2_what_happened\": ai.what_happened,\n  \"3_what_to_look_at\": (ai.key_evidence || []).map(e => e.item),\n  \"4_why_these_details_matter\": (ai.key_evidence || []).map(e => ({ item: e.item, why_it_matters: e.detail })),\n  \"5_suspicious_indicators\": (ai.suspicious_indicators || []).map(s => ({ indicator: s.item, evidence: s.detail })),\n  \"6_possible_benign_explanations\": ai.benign_explanations,\n  \"7_what_to_verify\": (ai.verification_steps || []).map(v => ({ check: v.item, purpose: v.detail })),\n  \"8_current_verdict\": ai.verdict,\n  \"9_priority\": j.priority,\n  \"10_recommended_next_action\": ai.recommended_action,\n  \"11_supporting_actions\": ai.supporting_actions,\n  \"12_mitre_attack_context\": {\n    verified: j.evidence_package?.enrichment?.mitre_verified,\n    unresolved_requires_manual_check: j.evidence_package?.enrichment?.mitre_unresolved,\n    model_cited_ids_validated: j.validation?.mitre_validation || []\n  },\n  \"13_cve_context\": {\n    verified: j.evidence_package?.enrichment?.cve_context,\n    model_cited_ids_validated: j.validation?.cve_validation || []\n  },\n  \"14_reasoning\": ai.reasoning,\n  \"15_validation_and_transparency\": {\n    model_confidence: ai.confidence,\n    severity: ai.severity,\n    schema_issues: j.validation?.schema_issues || [],\n    is_usable: j.validation?.is_usable,\n    known_unknowns: j.evidence_package?.known_unknowns || [],\n    countermeasures_suggested: ai.countermeasures,\n    raw_model_output: j.ai_raw,\n    note: \"Confidence is the model's self-assessment, not proof. Verify flagged/unresolved/unvalidated claims manually before acting.\"\n  }\n};\n\nreturn { json: { wazuh_alert_id: j.wazuh_alert_id, generated_at: new Date().toISOString(), analyst_report: report } };"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -704,
+        -240
+      ],
+      "id": "5f374d33-8090-4a7c-935b-5448320a80f3",
+      "name": "Build Analyst Report1"
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "wazuh-alert",
+        "responseMode": "lastNode",
+        "responseData": "allEntries",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2.1,
+      "position": [
+        -4064,
+        -144
+      ],
+      "id": "f3e240ba-207a-4c94-b259-cb964ee66d36",
+      "name": "Webhook1",
+      "webhookId": "3a9b94c4-36f5-49c2-8ad3-26c131a3fde5"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://YOUR-IRIS-HOST:8443/alerts/add",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{$json}}",
+        "options": {
+          "allowUnauthorizedCerts": true
+        }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [
+        -464,
+        -48
+      ],
+      "id": "0f66547c-fefc-4c91-8125-712e93ae4866",
+      "name": "IRIS alertADD",
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "eGKznJNzIM9VI44R",
+          "name": "Header Auth account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const j = $json;\nconst ai = j.analyst_report;\nconst sev = ai[\"15_validation_and_transparency\"].severity;\n\n// IRIS's default severity taxonomy is 1=Low, 2=Medium, 3=High, 4=Critical -\n// check Manage > Severities in your IRIS instance to confirm these IDs match yours.\nconst severityMap = { LOW: 1, MEDIUM: 2, HIGH: 3, CRITICAL: 4, NONE: 1 };\nconst severity_id = severityMap[sev] || 2;\n\nconst verdict = ai[\"8_current_verdict\"];\nconst priority = ai[\"9_priority\"]?.level || 'N/A';\n\nconst payload = {\n  alert_title: `[AI Triage] ${verdict} \u2014 ${ai[\"1_alert_summary\"]?.slice(0, 80) || 'Alert'}`,\n  alert_description: j.markdown_report || ai[\"1_alert_summary\"],\n  alert_source: \"n8n-ai-soc-triage\",\n  alert_source_ref: j.wazuh_alert_id,\n  alert_source_event_time: j.generated_at,\n  alert_severity_id: severity_id,\n  alert_status_id: 2, // \"New\" in most default IRIS installs - confirm against your instance\n  alert_tags: `ai-triage,verdict:${verdict},priority:${priority}`,\n  alert_customer_id: 2, // swap for your actual customer ID in IRIS\n  alert_source_content: ai, // full structured report, so an analyst can drill into evidence/reasoning in IRIS's raw-event view\n  alert_note: `Confidence: ${ai[\"15_validation_and_transparency\"].model_confidence}% | Schema issues: ${(ai[\"15_validation_and_transparency\"].schema_issues || []).join(', ') || 'none'}`\n};\n\nreturn { json: payload };"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -560,
+        -240
+      ],
+      "id": "aac02338-f1c3-408e-8cf1-7e005ec1ca14",
+      "name": "Build IRIS Alert Payload"
+    }
+  ],
+  "pinData": {
+    "Build Analyst Report1": [
+      {
+        "json": {
+          "wazuh_alert_id": "1696512345.987654",
+          "generated_at": "2026-10-05T09:05:47.758Z",
+          "analyst_report": {
+            "1_alert_summary": "The alert characterizes a critical software weakness in Apache Log4j 2.14.1 as CVE-2021-44228. This maps to T1190 because it is an RCE vulnerability.",
+            "2_what_happened": "The CVE describes a software weakness. This maps to T1190 because it is an RCE vulnerability.",
+            "3_what_to_look_at": [
+              "Vulnerability CVE-2021-44228"
+            ],
+            "4_why_these_details_matter": [
+              {
+                "item": "Vulnerability CVE-2021-44228",
+                "why_it_matters": "Remote Code Execution (RCE) vulnerability in Apache Log4j 2.14.1 allows for potential system compromise."
+              }
+            ],
+            "5_suspicious_indicators": [],
+            "6_possible_benign_explanations": [
+              "The CVE describes a software weakness, not an event where malicious activity occurred.",
+              "There is no evidence of active exploitation in this alert."
+            ],
+            "7_what_to_verify": [
+              {
+                "check": "Verify software version of log4j-core.jar on affected hosts.",
+                "purpose": "Ensure the vulnerability is actually present."
+              },
+              {
+                "check": "Inspect logs for JNDI lookups containing 'jndi:ldap' or 'jndi:rmi'.",
+                "purpose": "Detect exploitation attempts in real-time."
+              }
+            ],
+            "8_current_verdict": "NEEDS_INVESTIGATION",
+            "9_priority": {
+              "level": "P1",
+              "score": 8
+            },
+            "10_recommended_next_action": "Update Apache Log4j to version 2.17.1 or later, or 2.12.1 (for Java 8). This resolves CVE-2021-44228.",
+            "11_supporting_actions": [],
+            "12_mitre_attack_context": {
+              "verified": [],
+              "unresolved_requires_manual_check": [],
+              "model_cited_ids_validated": [
+                {
+                  "id": "T1190",
+                  "status": "UNVALIDATED_NOT_IN_EVIDENCE"
+                }
+              ]
+            },
+            "13_cve_context": {
+              "verified": {
+                "status": "VERIFIED",
+                "cve_id": "CVE-2021-44228",
+                "description": "Apache Log4j2 2.0-beta9 through 2.15.0 (excluding security releases 2.12.2, 2.12.3, and 2.3.1) JNDI features used in configuration, log messages, and parameters do not protect against attacker controlled LDAP and other JNDI related endpoints. An attacker who can control log messages or log message parameters can execute arbitrary code loaded from LDAP servers when message lookup substitution is enabled. From log4j 2.15.0, this behavior has been disabled by default. From version 2.16.0 (along with 2.12.2, 2.12.3, and 2.3.1), this functionality has been completely removed. Note that this vulnerability is specific to log4j-core and does not affect log4net, log4cxx, or other Apache Logging Services projects.",
+                "cvss_score": 10,
+                "cvss_severity": "CRITICAL"
+              },
+              "model_cited_ids_validated": [
+                {
+                  "id": "CVE-2021-44228",
+                  "status": "PRESENT_IN_ALERT"
+                }
+              ]
+            },
+            "14_reasoning": "The CVE describes a critical software weakness. This maps to T1190 because it is an RCE vulnerability. The risk is high due to the ability of remote attackers to execute code on affected systems.",
+            "15_validation_and_transparency": {
+              "model_confidence": 100,
+              "severity": "CRITICAL",
+              "schema_issues": [],
+              "is_usable": true,
+              "known_unknowns": [
+                "user/account not present in alert",
+                "process not present in alert",
+                "parent process not present in alert",
+                "command line not present in alert",
+                "network source/destination not present in alert"
+              ],
+              "countermeasures_suggested": [
+                "Update Apache Log4j to version 2.17.1 or later",
+                "Update Apache Log4j to version 2.12.3 (for Java 8) or 2.12.2 (for Java 9)"
+              ],
+              "raw_model_output": {
+                "benign_possibilities": [
+                  "The CVE describes a software weakness, not an event where malicious activity occurred.",
+                  "There is no evidence of active exploitation in this alert."
+                ],
+                "confidence": 100,
+                "cve_ids": [
+                  "CVE-2021-44228"
+                ],
+                "key_evidence": [
+                  {
+                    "item": "Vulnerability CVE-2021-44228",
+                    "why_it_matters": "Remote Code Execution (RCE) vulnerability in Apache Log4j 2.14.1 allows for potential system compromise."
+                  }
+                ],
+                "mitre_ids": [
+                  "T1190"
+                ],
+                "reasoning": "The CVE describes a critical software weakness. This maps to T1190 because it is an RCE vulnerability. The risk is high due to the ability of remote attackers to execute code on affected systems.",
+                "recommended_action": "Update Apache Log4j to version 2.17.1 or later, or 2.12.1 (for Java 8). This resolves CVE-2021-44228.",
+                "severity": "CRITICAL",
+                "summary": "The alert characterizes a critical software weakness in Apache Log4j 2.14.1 as CVE-2021-44228. This maps to T1190 because it is an RCE vulnerability.",
+                "suspicious_indicators": [],
+                "verdict": "NEEDS_INVESTIGATION",
+                "verification_steps": [
+                  {
+                    "check": "Verify software version of log4j-core.jar on affected hosts.",
+                    "purpose": "Ensure the vulnerability is actually present."
+                  },
+                  {
+                    "check": "Inspect logs for JNDI lookups containing 'jndi:ldap' or 'jndi:rmi'.",
+                    "purpose": "Detect exploitation attempts in real-time."
+                  }
+                ],
+                "what_happened": "The CVE describes a software weakness. This maps to T1190 because it is an RCE vulnerability.",
+                "countermeasures": [
+                  "Update Apache Log4j to version 2.17.1 or later",
+                  "Update Apache Log4j to version 2.12.3 (for Java 8) or 2.12.2 (for Java 9)"
+                ]
+              },
+              "note": "Confidence is the model's self-assessment, not proof. Verify flagged/unresolved/unvalidated claims manually before acting."
+            }
+          }
+        },
+        "pairedItem": {
+          "item": 0
+        }
+      }
+    ],
+    "Build IRIS Alert Payload": [
+      {
+        "json": {
+          "alert_title": "[AI Triage] NEEDS_INVESTIGATION \u2014 The alert characterizes a critical software weakness in Apache Log4j 2.14.1 as C",
+          "alert_description": "The alert characterizes a critical software weakness in Apache Log4j 2.14.1 as CVE-2021-44228. This maps to T1190 because it is an RCE vulnerability.",
+          "alert_source": "n8n-ai-soc-triage",
+          "alert_source_ref": "1696512345.987654",
+          "alert_source_event_time": "2026-10-05T09:05:47.758Z",
+          "alert_severity_id": 4,
+          "alert_status_id": 2,
+          "alert_tags": "ai-triage,verdict:NEEDS_INVESTIGATION,priority:P1",
+          "alert_customer_id": 2,
+          "alert_source_content": {
+            "1_alert_summary": "The alert characterizes a critical software weakness in Apache Log4j 2.14.1 as CVE-2021-44228. This maps to T1190 because it is an RCE vulnerability.",
+            "2_what_happened": "The CVE describes a software weakness. This maps to T1190 because it is an RCE vulnerability.",
+            "3_what_to_look_at": [
+              "Vulnerability CVE-2021-44228"
+            ],
+            "4_why_these_details_matter": [
+              {
+                "item": "Vulnerability CVE-2021-44228",
+                "why_it_matters": "Remote Code Execution (RCE) vulnerability in Apache Log4j 2.14.1 allows for potential system compromise."
+              }
+            ],
+            "5_suspicious_indicators": [],
+            "6_possible_benign_explanations": [
+              "The CVE describes a software weakness, not an event where malicious activity occurred.",
+              "There is no evidence of active exploitation in this alert."
+            ],
+            "7_what_to_verify": [
+              {
+                "check": "Verify software version of log4j-core.jar on affected hosts.",
+                "purpose": "Ensure the vulnerability is actually present."
+              },
+              {
+                "check": "Inspect logs for JNDI lookups containing 'jndi:ldap' or 'jndi:rmi'.",
+                "purpose": "Detect exploitation attempts in real-time."
+              }
+            ],
+            "8_current_verdict": "NEEDS_INVESTIGATION",
+            "9_priority": {
+              "level": "P1",
+              "score": 8
+            },
+            "10_recommended_next_action": "Update Apache Log4j to version 2.17.1 or later, or 2.12.1 (for Java 8). This resolves CVE-2021-44228.",
+            "11_supporting_actions": [],
+            "12_mitre_attack_context": {
+              "verified": [],
+              "unresolved_requires_manual_check": [],
+              "model_cited_ids_validated": [
+                {
+                  "id": "T1190",
+                  "status": "UNVALIDATED_NOT_IN_EVIDENCE"
+                }
+              ]
+            },
+            "13_cve_context": {
+              "verified": {
+                "status": "VERIFIED",
+                "cve_id": "CVE-2021-44228",
+                "description": "Apache Log4j2 2.0-beta9 through 2.15.0 (excluding security releases 2.12.2, 2.12.3, and 2.3.1) JNDI features used in configuration, log messages, and parameters do not protect against attacker controlled LDAP and other JNDI related endpoints. An attacker who can control log messages or log message parameters can execute arbitrary code loaded from LDAP servers when message lookup substitution is enabled. From log4j 2.15.0, this behavior has been disabled by default. From version 2.16.0 (along with 2.12.2, 2.12.3, and 2.3.1), this functionality has been completely removed. Note that this vulnerability is specific to log4j-core and does not affect log4net, log4cxx, or other Apache Logging Services projects.",
+                "cvss_score": 10,
+                "cvss_severity": "CRITICAL"
+              },
+              "model_cited_ids_validated": [
+                {
+                  "id": "CVE-2021-44228",
+                  "status": "PRESENT_IN_ALERT"
+                }
+              ]
+            },
+            "14_reasoning": "The CVE describes a critical software weakness. This maps to T1190 because it is an RCE vulnerability. The risk is high due to the ability of remote attackers to execute code on affected systems.",
+            "15_validation_and_transparency": {
+              "model_confidence": 100,
+              "severity": "CRITICAL",
+              "schema_issues": [],
+              "is_usable": true,
+              "known_unknowns": [
+                "user/account not present in alert",
+                "process not present in alert",
+                "parent process not present in alert",
+                "command line not present in alert",
+                "network source/destination not present in alert"
+              ],
+              "countermeasures_suggested": [
+                "Update Apache Log4j to version 2.17.1 or later",
+                "Update Apache Log4j to version 2.12.3 (for Java 8) or 2.12.2 (for Java 9)"
+              ],
+              "raw_model_output": {
+                "benign_possibilities": [
+                  "The CVE describes a software weakness, not an event where malicious activity occurred.",
+                  "There is no evidence of active exploitation in this alert."
+                ],
+                "confidence": 100,
+                "cve_ids": [
+                  "CVE-2021-44228"
+                ],
+                "key_evidence": [
+                  {
+                    "item": "Vulnerability CVE-2021-44228",
+                    "why_it_matters": "Remote Code Execution (RCE) vulnerability in Apache Log4j 2.14.1 allows for potential system compromise."
+                  }
+                ],
+                "mitre_ids": [
+                  "T1190"
+                ],
+                "reasoning": "The CVE describes a critical software weakness. This maps to T1190 because it is an RCE vulnerability. The risk is high due to the ability of remote attackers to execute code on affected systems.",
+                "recommended_action": "Update Apache Log4j to version 2.17.1 or later, or 2.12.1 (for Java 8). This resolves CVE-2021-44228.",
+                "severity": "CRITICAL",
+                "summary": "The alert characterizes a critical software weakness in Apache Log4j 2.14.1 as CVE-2021-44228. This maps to T1190 because it is an RCE vulnerability.",
+                "suspicious_indicators": [],
+                "verdict": "NEEDS_INVESTIGATION",
+                "verification_steps": [
+                  {
+                    "check": "Verify software version of log4j-core.jar on affected hosts.",
+                    "purpose": "Ensure the vulnerability is actually present."
+                  },
+                  {
+                    "check": "Inspect logs for JNDI lookups containing 'jndi:ldap' or 'jndi:rmi'.",
+                    "purpose": "Detect exploitation attempts in real-time."
+                  }
+                ],
+                "what_happened": "The CVE describes a software weakness. This maps to T1190 because it is an RCE vulnerability.",
+                "countermeasures": [
+                  "Update Apache Log4j to version 2.17.1 or later",
+                  "Update Apache Log4j to version 2.12.3 (for Java 8) or 2.12.2 (for Java 9)"
+                ]
+              },
+              "note": "Confidence is the model's self-assessment, not proof. Verify flagged/unresolved/unvalidated claims manually before acting."
+            }
+          },
+          "alert_note": "Confidence: 100% | Schema issues: none"
+        },
+        "pairedItem": {
+          "item": 0
+        }
+      }
+    ]
+  },
+  "connections": {
+    "Validate Input": {
+      "main": [
+        [
+          {
+            "node": "IF Valid Alert",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IF Valid Alert": {
+      "main": [
+        [
+          {
+            "node": "Normalize Alert",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Invalid Alert Report",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalize Alert": {
+      "main": [
+        [
+          {
+            "node": "Extract MITRE and CVE",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extract MITRE and CVE": {
+      "main": [
+        [
+          {
+            "node": "Resolve MITRE",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Resolve MITRE": {
+      "main": [
+        [
+          {
+            "node": "IF Has CVE",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IF Has CVE": {
+      "main": [
+        [
+          {
+            "node": "Lookup NVD",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Set Empty NVD Context",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Lookup NVD": {
+      "main": [
+        [
+          {
+            "node": "Extract NVD Context",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extract NVD Context": {
+      "main": [
+        [
+          {
+            "node": "Build Evidence Package",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Set Empty NVD Context": {
+      "main": [
+        [
+          {
+            "node": "Build Evidence Package",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Evidence Package": {
+      "main": [
+        [
+          {
+            "node": "Build LLM Prompt",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build LLM Prompt": {
+      "main": [
+        [
+          {
+            "node": "Ollama LLM Call1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Calculate Priority": {
+      "main": [
+        [
+          {
+            "node": "Build Analyst Report1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Ollama LLM Call1": {
+      "main": [
+        [
+          {
+            "node": "Parse LLM Output1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse LLM Output1": {
+      "main": [
+        [
+          {
+            "node": "Validate LLM Output1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate LLM Output1": {
+      "main": [
+        [
+          {
+            "node": "Calculate Priority",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Webhook1": {
+      "main": [
+        [
+          {
+            "node": "Validate Input",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Analyst Report1": {
+      "main": [
+        [
+          {
+            "node": "Build IRIS Alert Payload",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build IRIS Alert Payload": {
+      "main": [
+        [
+          {
+            "node": "IRIS alertADD",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate",
+    "availableInMCP": false
+  },
+  "nodeGroups": [],
+  "tags": []
+}

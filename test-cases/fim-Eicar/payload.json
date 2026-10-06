@@ -1,0 +1,150 @@
+{
+  "timestamp": "2026-10-05T17:01:42.377+0530",
+  "rule": {
+    "level": 7,
+    "description": "Integrity checksum changed.",
+    "id": "550",
+    "mitre": {
+      "id": [
+        "T1565.001"
+      ],
+      "tactic": [
+        "Impact"
+      ],
+      "technique": [
+        "Stored Data Manipulation"
+      ]
+    },
+    "firedtimes": 1,
+    "mail": false,
+    "groups": [
+      "ossec",
+      "syscheck",
+      "syscheck_entry_modified",
+      "syscheck_file"
+    ],
+    "pci_dss": [
+      "11.5"
+    ],
+    "gpg13": [
+      "4.11"
+    ],
+    "gdpr": [
+      "II_5.1.f"
+    ],
+    "hipaa": [
+      "164.312.c.1",
+      "164.312.c.2"
+    ],
+    "nist_800_53": [
+      "SI.7"
+    ],
+    "tsc": [
+      "PI1.4",
+      "PI1.5",
+      "CC6.1",
+      "CC6.8",
+      "CC7.2",
+      "CC7.3"
+    ]
+  },
+  "agent": {
+    "id": "002",
+    "name": "winuser",
+    "ip": "192.168.100.88"
+  },
+  "manager": {
+    "name": "SOC-Lab"
+  },
+  "id": "1791199902.63714",
+  "full_log": "File 'c:\\sensitive data\\eicar.com.txt' modified\nMode: realtime\nChanged attributes: mtime\nOld modification time was: '1791199457', now it is '1791199893'\n",
+  "syscheck": {
+    "path": "c:\\sensitive data\\eicar.com.txt",
+    "mode": "realtime",
+    "size_after": "70",
+    "win_perm_after": [
+      {
+        "name": "Administrators",
+        "allowed": [
+          "DELETE",
+          "READ_CONTROL",
+          "WRITE_DAC",
+          "WRITE_OWNER",
+          "SYNCHRONIZE",
+          "READ_DATA",
+          "WRITE_DATA",
+          "APPEND_DATA",
+          "READ_EA",
+          "WRITE_EA",
+          "EXECUTE",
+          "READ_ATTRIBUTES",
+          "WRITE_ATTRIBUTES"
+        ]
+      },
+      {
+        "name": "SYSTEM",
+        "allowed": [
+          "DELETE",
+          "READ_CONTROL",
+          "WRITE_DAC",
+          "WRITE_OWNER",
+          "SYNCHRONIZE",
+          "READ_DATA",
+          "WRITE_DATA",
+          "APPEND_DATA",
+          "READ_EA",
+          "WRITE_EA",
+          "EXECUTE",
+          "READ_ATTRIBUTES",
+          "WRITE_ATTRIBUTES"
+        ]
+      },
+      {
+        "name": "Users",
+        "allowed": [
+          "READ_CONTROL",
+          "SYNCHRONIZE",
+          "READ_DATA",
+          "READ_EA",
+          "EXECUTE",
+          "READ_ATTRIBUTES"
+        ]
+      },
+      {
+        "name": "Authenticated Users",
+        "allowed": [
+          "DELETE",
+          "READ_CONTROL",
+          "SYNCHRONIZE",
+          "READ_DATA",
+          "WRITE_DATA",
+          "APPEND_DATA",
+          "READ_EA",
+          "WRITE_EA",
+          "EXECUTE",
+          "READ_ATTRIBUTES",
+          "WRITE_ATTRIBUTES"
+        ]
+      }
+    ],
+    "uid_after": "S-1-5-21-743268135-638795918-1634452857-1000",
+    "md5_after": "e7e5fa40569514ec442bbdf755d89c2f",
+    "sha1_after": "a6c80ce949469cc86f6c22355f4d3bb8773fc634",
+    "sha256_after": "8b3f191819931d1f2cef7289239b5f77c00b079847b9c2636e56854d1e5eff71",
+    "attrs_after": [
+      "ARCHIVE"
+    ],
+    "uname_after": "winuser",
+    "mtime_before": "2026-10-05T16:54:17",
+    "mtime_after": "2026-10-05T17:01:33",
+    "diff": "No content changes were found for this file.",
+    "changed_attributes": [
+      "mtime"
+    ],
+    "event": "modified"
+  },
+  "decoder": {
+    "name": "syscheck_integrity_changed"
+  },
+  "location": "syscheck"
+}

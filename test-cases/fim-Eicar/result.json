@@ -1,0 +1,126 @@
+{
+  "wazuh_alert_id": "1791199902.63714",
+  "generated_at": "2026-10-05T12:06:30.238Z",
+  "analyst_report": {
+    "1_alert_summary": "A file integrity alert was triggered for a sensitive data file on Windows host.",
+    "2_what_happened": "Wazuh detected that the 'c:\\sensitive data\\eicar.com.txt' file's modification time changed from '1791199457' to '1791199893'.",
+    "3_what_to_look_at": [
+      "file path"
+    ],
+    "4_why_these_details_matter": [
+      {
+        "item": "file path",
+        "why_it_matters": "identifies what was touched"
+      }
+    ],
+    "5_suspicious_indicators": [
+      {
+        "indicator": "unexpected file modification",
+        "evidence": "mtime changed from '1791199457' to '1791199893'"
+      }
+    ],
+    "6_possible_benign_explanations": [
+      "scheduled backup job touched the file",
+      "antivirus scan updated metadata"
+    ],
+    "7_what_to_verify": [
+      {
+        "check": "review process that modified the file",
+        "purpose": "confirm if it was an authorized process"
+      }
+    ],
+    "8_current_verdict": "NEEDS_INVESTIGATION",
+    "9_priority": {
+      "level": "P3",
+      "score": 4
+    },
+    "10_recommended_next_action": "Identify the process/user that modified the file before escalating.",
+    "11_supporting_actions": [
+      "check scheduled tasks on host",
+      "review antivirus logs for recent updates"
+    ],
+    "12_mitre_attack_context": {
+      "verified": [
+        {
+          "id": "T1565.001",
+          "name": "Stored Data Manipulation",
+          "tactic": "Impact",
+          "status": "VERIFIED"
+        }
+      ],
+      "unresolved_requires_manual_check": [],
+      "model_cited_ids_validated": [
+        {
+          "id": "T1565.001",
+          "status": "VERIFIED"
+        }
+      ]
+    },
+    "13_cve_context": {
+      "verified": {
+        "status": "NO_CVE_PRESENT"
+      },
+      "model_cited_ids_validated": []
+    },
+    "14_reasoning": "The modification time of a sensitive data file changed unexpectedly, which is suspicious. However, no direct evidence points to malicious intent; it could be due to scheduled tasks or antivirus updates. Further investigation is needed to confirm if this was an authorized change.",
+    "15_validation_and_transparency": {
+      "model_confidence": 50,
+      "severity": "MEDIUM",
+      "schema_issues": [],
+      "is_usable": true,
+      "known_unknowns": [
+        "user/account not present in alert",
+        "process not present in alert",
+        "parent process not present in alert",
+        "command line not present in alert",
+        "network source/destination not present in alert"
+      ],
+      "countermeasures_suggested": [
+        "enable process auditing for this file path"
+      ],
+      "raw_model_output": {
+        "summary": "A file integrity alert was triggered for a sensitive data file on Windows host.",
+        "what_happened": "Wazuh detected that the 'c:\\sensitive data\\eicar.com.txt' file's modification time changed from '1791199457' to '1791199893'.",
+        "key_evidence": [
+          {
+            "item": "file path",
+            "why_it_matters": "identifies what was touched"
+          }
+        ],
+        "suspicious_indicators": [
+          {
+            "indicator": "unexpected file modification",
+            "evidence": "mtime changed from '1791199457' to '1791199893'"
+          }
+        ],
+        "benign_possibilities": [
+          "scheduled backup job touched the file",
+          "antivirus scan updated metadata"
+        ],
+        "verification_steps": [
+          {
+            "check": "review process that modified the file",
+            "purpose": "confirm if it was an authorized process"
+          }
+        ],
+        "verdict": "NEEDS_INVESTIGATION",
+        "confidence": 50,
+        "severity": "MEDIUM",
+        "recommended_action": "Identify the process/user that modified the file before escalating.",
+        "reasoning": "The modification time of a sensitive data file changed unexpectedly, which is suspicious. However, no direct evidence points to malicious intent; it could be due to scheduled tasks or antivirus updates. Further investigation is needed to confirm if this was an authorized change.",
+        "mitre_ids": [
+          "T1565.001"
+        ],
+        "cve_ids": [],
+        "supporting_actions": [
+          "check scheduled tasks on host",
+          "review antivirus logs for recent updates"
+        ],
+        "countermeasures": [
+          "enable process auditing for this file path"
+        ]
+      },
+      "note": "Confidence is the model's self-assessment, not proof. Verify flagged/unresolved/unvalidated claims manually before acting."
+    }
+  }
+}

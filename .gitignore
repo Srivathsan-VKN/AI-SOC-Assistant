@@ -1,0 +1,4 @@
+.env
+*.key
+credentials.json
+node_modules/
